@@ -1,0 +1,357 @@
+name: Build in container
+
+# Builds the toolchain inside a container image so the result is linked against
+# the image's glibc rather than the runner's. This is intentionally parallel to
+# build-reusable.yaml rather than a conditional path inside it: the two paths
+# differ in enough steps (no apt install, docker-wrapped configure/make, glibc
+# verification) that sharing a file would force reviewers to reason about both
+# paths at once. A bug here cannot reach the Ubuntu matrix.
+#
+# WHEN CHANGING THE BUILD RECIPE, CHANGE build-reusable.yaml AS WELL. Both
+# follow: configure -> make -> optional LLVM-on-prebuilt -> tarball -> upload.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: "Named identifier for the artifact, optional"
+        type: string
+        default: ''
+      image:
+        description: "Container image providing the host toolchain"
+        type: string
+        required: true
+      image-os:
+        description: >-
+          OS label used in artifact names (e.g. centos7). Occupies the same
+          position as the runner label in build-reusable.yaml so artifacts land
+          in the same release.
+        type: string
+        required: true
+      mode:
+        description: "Mode list"
+        type: string
+        default: '["linux","newlib"]'
+      target:
+        description: "Target list"
+        type: string
+        default: '["rv64gc-lp64d"]'
+      compiler:
+        description: "Compiler list"
+        type: string
+        default: '["gcc","llvm"]'
+      languages:
+        description: "Languages list"
+        type: string
+        default: '[""]'
+      cmodel:
+        description: "C model list"
+        type: string
+        default: '[""]'
+      strip:
+        description: "Options to build unstripped, stripped or both, must be one of 'unstripped', 'stripped', 'both'"
+        type: string
+        default: 'unstripped'
+      use-prebuilt-gnu:
+        description: >-
+          Do not build the GNU toolchain; take it from the artifact that the
+          gcc call of the same workflow run published, and build only LLVM on
+          top of it. Requires compiler '["llvm"]'.
+        type: boolean
+        default: false
+
+env:
+  submodule_paths: |
+    binutils
+    dejagnu
+    gcc
+    gdb
+    glibc
+    llvm
+    musl
+    newlib
+    picolibc
+    pk
+    qemu
+    spike
+    uclibc-ng
+    .git/modules
+
+jobs:
+  validate_inputs:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check strip input
+        run: |
+          if [[ "${{ inputs.strip }}" != "unstripped" && "${{ inputs.strip }}" != "stripped" && "${{ inputs.strip }}" != "both" ]]; then
+            echo "Invalid strip option: ${{ inputs.strip }}. Must be one of 'unstripped', 'stripped', 'both'."
+            exit 1
+          fi
+
+      - name: Check use-prebuilt-gnu input
+        if: ${{ inputs.use-prebuilt-gnu }}
+        run: |
+          if [ "$(echo '${{ inputs.compiler }}' | tr -d '[]\" ')" != "llvm" ]; then
+            echo "use-prebuilt-gnu requires compiler '[\"llvm\"]', got ${{ inputs.compiler }}."
+            exit 1
+          fi
+          if [[ "${{ inputs.strip }}" == "stripped" ]]; then
+            echo "use-prebuilt-gnu needs strip 'unstripped' or 'both', got 'stripped'."
+            exit 1
+          fi
+
+  submodule_cache:
+    name: Initialize submodule cache
+    needs: [validate_inputs]
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.keygen.outputs.smcache_key }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Remove unneeded frameworks to recover disk space
+        run: sudo ./.github/cleanup-rootfs.sh
+
+      - name: Generate submodule cache key
+        id: keygen
+        run: echo "smcache_key=smcache-$(printf $(git submodule | sha1sum))" >> $GITHUB_OUTPUT
+
+      - name: Setup submodule cache
+        id: smcache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.submodule_paths }}
+          key: ${{ steps.keygen.outputs.smcache_key }}
+
+      - name: Checkout required submodules
+        if: steps.smcache.outputs.cache-hit != 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            if git submodule update --init -j $(nproc) --depth 1 \
+                 $(git submodule | awk '{print $2}'); then
+              exit 0
+            fi
+            echo "submodule checkout failed (attempt ${i}), retrying in $((i * 30))s"
+            sleep $((i * 30))
+          done
+          exit 1
+
+      - name: Storage size optimization
+        if: steps.smcache.outputs.cache-hit != 'true'
+        run: |
+          git submodule foreach 'git maintenance run'
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [submodule_cache, validate_inputs]
+    env:
+      IMAGE: ${{ inputs.image }}
+      CCACHE_DIR: /mnt/ccache
+      CCACHE_MAXSIZE: 2G
+      smcache_key: ${{ needs.submodule_cache.outputs.key }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(inputs.mode) }}
+        target: ${{ fromJSON(inputs.target) }}
+        compiler: ${{ fromJSON(inputs.compiler) }}
+        cmodel: ${{ fromJSON(inputs.cmodel) }}
+        languages: ${{ fromJSON(inputs.languages) }}
+        strip:
+          - ${{ inputs.strip }}
+        exclude:
+          - mode: uclibc
+            compiler: llvm
+          - mode: picolibc
+            compiler: llvm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate artifact names
+        id: names
+        run: |
+          if [[ "${{ matrix.target }}" == *"32"* ]]; then BITS=32; else BITS=64; fi
+          case "${{ matrix.mode }}" in
+            "linux")    MODE="glibc";;
+            "musl")     MODE="musl";;
+            "uclibc")   MODE="uclibc-ng";;
+            "picolibc") MODE="elf-picolibc";;
+            *)          MODE="elf";;
+          esac
+          SUFFIX=""
+          if [ -n "${{ inputs.artifact-name }}" ]; then
+            SUFFIX="-${{ inputs.artifact-name }}"
+          fi
+          BASE="riscv$BITS-$MODE-${{ inputs.image-os }}-${{ matrix.compiler }}"
+          echo "TOOLCHAIN_NAME=${BASE}${SUFFIX}" >> $GITHUB_OUTPUT
+          echo "TOOLCHAIN_NAME_STRIPPED=${BASE}-stripped${SUFFIX}" >> $GITHUB_OUTPUT
+          echo "GNU_NAME=riscv$BITS-$MODE-${{ inputs.image-os }}-gcc${SUFFIX}" >> $GITHUB_OUTPUT
+
+      - name: Remove unneeded frameworks to recover disk space
+        run: sudo ./.github/cleanup-rootfs.sh
+
+      - name: Configure swap space
+        run: |
+          if swapon --noheadings --show=NAME | grep -qx /swapfile; then
+            sudo swapoff /swapfile
+          fi
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Log in to the image registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull the build image
+        run: docker pull "${IMAGE}"
+
+      - name: Prepare /mnt
+        run: |
+          sudo mkdir -p /mnt/riscv /mnt/ccache
+          sudo chown -R runner:runner /mnt/riscv /mnt/ccache
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-v1-${{ inputs.image-os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-v1-${{ inputs.image-os }}-
+
+      - name: Load submodule cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.submodule_paths }}
+          key: ${{ env.smcache_key }}
+
+      - name: Initialize ccache
+        run: |
+          ./.github/docker/centos7/in-container.sh \
+            'ccache -M "${CCACHE_MAXSIZE}" && ccache -z && ccache -s'
+
+      - name: Download prebuilt GNU toolchain
+        if: ${{ inputs.use-prebuilt-gnu }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.names.outputs.GNU_NAME }}
+          path: prebuilt-gnu
+
+      - name: Configure toolchain
+        run: |
+          TARGET_TUPLE=($(echo ${{ matrix.target }} | tr "-" "\n"))
+          ARGS=""
+          if [ "${{ matrix.compiler }}" == "llvm" ]; then ARGS="$ARGS --enable-llvm"; fi
+          if [ -n "${{ matrix.cmodel }}" ]; then ARGS="$ARGS --with-cmodel=${{ matrix.cmodel }}"; fi
+          if [ -n "${{ matrix.languages }}" ]; then ARGS="$ARGS --with-languages=${{ matrix.languages }}"; fi
+          ./.github/docker/centos7/in-container.sh \
+            "./configure --prefix=/mnt/riscv \
+               --with-arch=${TARGET_TUPLE[0]} --with-abi=${TARGET_TUPLE[1]} $ARGS"
+          sudo mkdir -p /mnt/riscv
+          sudo chown runner:runner /mnt/riscv
+
+      - name: Restore prebuilt GNU toolchain
+        if: ${{ inputs.use-prebuilt-gnu }}
+        run: |
+          tar xJf prebuilt-gnu/${{ steps.names.outputs.GNU_NAME }}.tar.xz -C /mnt/
+          rm -rf prebuilt-gnu
+          ls /mnt/riscv/bin/*-gcc >/dev/null 2>&1 || {
+            echo "error: restored artifact contains no cross gcc in /mnt/riscv/bin"
+            exit 1
+          }
+
+      - name: Build toolchain
+        if: ${{ !inputs.use-prebuilt-gnu }}
+        run: |
+          ./.github/docker/centos7/in-container.sh 'make -j $(nproc) ${{ matrix.mode }}'
+
+      - name: Build LLVM on the prebuilt GNU toolchain
+        if: ${{ inputs.use-prebuilt-gnu }}
+        run: |
+          ./.github/docker/centos7/in-container.sh \
+            'make -j $(nproc) \
+               FLANG_PARALLEL_COMPILE_JOBS=$(( ($(nproc) + 1) / 2 )) \
+               -o stamps/build-gcc-${{ matrix.mode }}-stage2 \
+               stamps/build-llvm-${{ matrix.mode }}'
+
+      - name: Show ccache statistics
+        if: always()
+        run: ./.github/docker/centos7/in-container.sh 'ccache -s' || true
+
+      - name: Save ccache
+        if: |
+          always()
+          && !cancelled()
+          && github.event_name != 'pull_request'
+          && matrix.mode == 'linux'
+          && matrix.target == 'rv64gc-lp64d'
+          && matrix.compiler == 'gcc'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-v1-${{ inputs.image-os }}-${{ github.run_id }}
+
+      - name: Remove build trees before packaging
+        run: rm -rf build-* stamps install-host-gcc install-newlib-nano
+
+      - name: Verify the toolchain runs on the target glibc
+        run: |
+          docker run --rm -v /mnt:/mnt "${IMAGE}" bash -lc '
+            set -e
+            PREFIX=/mnt/riscv
+            echo "--- runner image ---"
+            cat /etc/centos-release
+            ldd --version | head -1
+            echo "--- max glibc symbol required by host binaries ---"
+            for b in $(find $PREFIX/bin $PREFIX/libexec -type f -perm -u+x | head -40); do
+              strings "$b" 2>/dev/null | grep -o "GLIBC_2\.[0-9]*" || true
+            done | sort -V | uniq | tail -5
+            for cc in $PREFIX/bin/riscv64-unknown-linux-gnu-gcc \
+                      $PREFIX/bin/riscv64-unknown-elf-gcc; do
+              [ -x "$cc" ] || continue
+              echo "--- $cc ---"
+              "$cc" --version | head -1
+              printf "int main(void){return 0;}\n" > /tmp/t.c
+              "$cc" -c /tmp/t.c -o /tmp/t.o
+              file /tmp/t.o
+            done
+          '
+
+      - name: Tarball unstripped
+        if: ${{ inputs.strip == 'unstripped' || inputs.strip == 'both' }}
+        run: |
+          du -s -h /mnt/riscv
+          ./.github/dedup-dir.sh /mnt/riscv/
+          XZ_OPT="-e -T0" tar cJf riscv.tar.xz -C /mnt/ riscv/
+          mv riscv.tar.xz ${{ steps.names.outputs.TOOLCHAIN_NAME }}.tar.xz
+
+      - name: Strip binaries
+        run: |
+          find /mnt/riscv -type f -exec sh -c \
+            'file "$1" | grep -q "ELF" && strip "$1"' _ {} \;
+
+      - name: Tarball stripped
+        if: ${{ inputs.strip == 'stripped' || inputs.strip == 'both' }}
+        run: |
+          du -s -h /mnt/riscv
+          XZ_OPT="-e -T0" tar cJf riscv-stripped.tar.xz -C /mnt/ riscv/
+          mv riscv-stripped.tar.xz ${{ steps.names.outputs.TOOLCHAIN_NAME_STRIPPED }}.tar.xz
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.strip == 'unstripped' || inputs.strip == 'both' }}
+        with:
+          name: ${{ steps.names.outputs.TOOLCHAIN_NAME }}
+          path: ${{ steps.names.outputs.TOOLCHAIN_NAME }}.tar.xz
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.strip == 'stripped' || inputs.strip == 'both' }}
+        with:
+          name: ${{ steps.names.outputs.TOOLCHAIN_NAME_STRIPPED }}
+          path: ${{ steps.names.outputs.TOOLCHAIN_NAME_STRIPPED }}.tar.xz
+          compression-level: 0
