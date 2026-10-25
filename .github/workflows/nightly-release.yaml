@@ -66,8 +66,41 @@ jobs:
       compiler: '["llvm"]'
       use-prebuilt-gnu: true
 
+  # CentOS 7 (glibc 2.17) rows, built inside the builder image so the result
+  # runs on CentOS 7 and every newer Linux. The image-os label "centos7"
+  # occupies the runner-label slot in artifact names, so create-release
+  # collects them alongside the Ubuntu artifacts.
+  build-centos7:
+    needs: [activity-check]
+    if: needs.activity-check.outputs.stale != 'true'
+    uses: ./.github/workflows/build-container-reusable.yaml
+    with:
+      image: ghcr.io/${{ github.repository }}/centos7-builder:latest
+      image-os: centos7
+      mode: '["linux","newlib"]'
+      target: '["rv64gc-lp64d"]'
+      compiler: '["gcc"]'
+
+  build-centos7-llvm:
+    needs: [build-centos7]
+    uses: ./.github/workflows/build-container-reusable.yaml
+    with:
+      image: ghcr.io/${{ github.repository }}/centos7-builder:latest
+      image-os: centos7
+      mode: '["linux","newlib"]'
+      target: '["rv64gc-lp64d"]'
+      compiler: '["llvm"]'
+      use-prebuilt-gnu: true
+
   create-release:
-    needs: [build, build-llvm]
+    # Waits for the centos7 rows so their artifacts are present when
+    # download-artifact runs. The if condition only requires the established
+    # Ubuntu jobs to succeed: a centos7 failure does not suppress the release.
+    needs: [build, build-llvm, build-centos7, build-centos7-llvm]
+    if: |
+      !cancelled()
+      && needs.build.result == 'success'
+      && needs.build-llvm.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
