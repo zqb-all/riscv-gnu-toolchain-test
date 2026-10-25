@@ -1,0 +1,27 @@
+# Git directories
+.git
+.gitignore
+.gitmodules
+
+# Build artifacts
+build-*
+stamps
+install-*
+*.tar.*
+*.tar.gz
+*.tar.xz
+
+# Documentation
+*.md
+!README.md
+
+# IDE and editor files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

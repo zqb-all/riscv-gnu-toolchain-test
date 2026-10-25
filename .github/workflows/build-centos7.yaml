@@ -1,0 +1,78 @@
+name: Build CentOS 7 builder image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-centos7.yaml'
+      - '.github/docker/centos7/**'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-centos7.yaml'
+      - '.github/docker/centos7/**'
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-docker-image:
+    name: Build and push CentOS 7 builder image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/centos7-builder
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-
+            type=ref,event=pr
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .github/docker/centos7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          docker pull "${IMAGE}"
+          docker run --rm "${IMAGE}" bash -c "
+            gcc --version | head -1
+            make --version | head -1
+            git --version
+            python3 --version
+            cmake --version | head -1
+            ninja --version
+            ccache --version | head -1
+          "
+
+      - name: Report image size
+        run: |
+          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          docker images "${IMAGE}" --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
