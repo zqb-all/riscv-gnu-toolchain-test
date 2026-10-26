@@ -186,13 +186,38 @@ RUN cd /tmp && \
     cd /tmp && rm -rf ccache-4.10.2* && \
     ccache --version | head -1
 
-# Host copies of gmp/mpfr/mpc let configure link them rather than rebuilding.
-RUN yum -y install \
-        gmp-devel mpfr-devel libmpc-devel \
-        glib2-devel expat-devel \
-        python3-pyelftools || \
-    python3 -m pip install --no-cache-dir pyelftools; \
-    yum clean all && ldconfig
+# CentOS 7 provides gmp-static, but no MPFR/MPC static packages.
+RUN yum --disablerepo=epel -y install \
+        gmp-devel gmp-static mpfr-devel libmpc-devel \
+        glib2-devel expat-devel && \
+    yum clean all && \
+    python3 -m pip install --no-cache-dir pyelftools
+
+# Host static archives are needed by --enable-host-static-libs. Install them
+# in GCC's default library search path; leave the system shared libraries intact.
+RUN cd /tmp && \
+    wget -q https://mirrors.aliyun.com/gnu/mpfr/mpfr-4.1.0.tar.gz && \
+    tar -xzf mpfr-4.1.0.tar.gz && \
+    cd mpfr-4.1.0 && \
+    ./configure --prefix=/usr/local --libdir=/usr/lib64 \
+        --enable-static --disable-shared && \
+    make -j$(nproc) && make install && \
+    cd /tmp && rm -rf mpfr-4.1.0* && \
+    wget -q https://mirrors.aliyun.com/gnu/mpc/mpc-1.2.1.tar.gz && \
+    tar -xzf mpc-1.2.1.tar.gz && \
+    cd mpc-1.2.1 && \
+    ./configure --prefix=/usr/local --libdir=/usr/lib64 \
+        --enable-static --disable-shared && \
+    make -j$(nproc) && make install && \
+    cd /tmp && rm -rf mpc-1.2.1* && \
+    wget -q https://libisl.sourceforge.io/isl-0.26.tar.bz2 && \
+    tar -xjf isl-0.26.tar.bz2 && \
+    cd isl-0.26 && \
+    ./configure --prefix=/usr/local --libdir=/usr/lib64 \
+        --enable-static --disable-shared --with-gmp-prefix=/usr/lib64 && \
+    make -j$(nproc) && make install && \
+    cd /tmp && rm -rf isl-0.26* && \
+    ldconfig
 
 RUN useradd -m -s /bin/bash builder && \
     echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
@@ -203,6 +228,7 @@ WORKDIR /home/builder
 ENV PATH="/usr/local/bin:/usr/lib64/ccache:${PATH}"
 ENV CCACHE_DIR="/home/builder/.ccache"
 ENV CCACHE_MAXSIZE="2G"
+ENV PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig"
 
 RUN set -e; \
     gcc --version | head -1; \
@@ -212,6 +238,12 @@ RUN set -e; \
     cmake --version | head -1; \
     ninja --version; \
     ccache --version | head -1; \
+    test -f "$(gcc --print-file-name=libgmp.a)"; \
+    test -f "$(gcc --print-file-name=libmpfr.a)"; \
+    test -f "$(gcc --print-file-name=libmpc.a)"; \
+    test -f "$(gcc --print-file-name=libisl.a)"; \
+    test -f "$(gcc --print-file-name=libzstd.a)" && echo "libzstd.a found" || echo "WARNING: libzstd.a not found"; \
+    pkg-config --exists libzstd && echo "pkg-config can find libzstd" || echo "WARNING: pkg-config cannot find libzstd"; \
     echo "--- CentOS 7 build image OK ---"
 
 CMD ["/bin/bash"]
